@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Find old Claude Code sessions by words you remember, then resume one.
+
+  ccfind                  interactive: type, pick with arrow keys, enter resumes
+  ccfind PROJ-142         same, query prefilled
+  ccfind -l PROJ-142      print matches and exit (no UI)
+All words must appear in a session (case-insensitive). Searches your messages,
+Claude's answers, tool calls and the start of tool output, never system reminders.
+"""
+import argparse
+import curses
+import json
+import locale
+import os
+import pickle
+import re
+import sys
+from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path.home() / ".claude" / "projects"
+CACHE = Path.home() / ".cache" / "ccfind" / "index.pkl"
+CACHE_VERSION = 5
+REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+TOOL_INPUT_CAP, TOOL_OUTPUT_CAP = 4000, 1500
+WHO_RANK = {"you": 0, "claude": 1, "tool": 2, "out": 3}
+HEADER_ROWS = 5
+
+
+# Index
+
+def record_chunks(rec):
+    typ = rec.get("type")
+    content = rec.get("message", {}).get("content")
+    if isinstance(content, str):
+        yield ("you" if typ == "user" else "claude"), content
+        return
+    for b in content or []:
+        t = b.get("type")
+        if t == "text":
+            yield ("you" if typ == "user" else "claude"), b.get("text", "")
+        elif t == "tool_use":
+            yield "tool", json.dumps(b.get("input", {}), ensure_ascii=False)[:TOOL_INPUT_CAP]
+        elif t == "tool_result":
+            c = b.get("content")
+            if isinstance(c, list):
+                c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+            yield "out", str(c or "")[:TOOL_OUTPUT_CAP]
+
+
+def parse_file(path):
+    rel = path.relative_to(ROOT).parts
+    # Subagent transcripts live under <project>/<session-id>/..., they belong to that session.
+    sid = rel[1] if len(rel) > 2 else path.stem
+    part = {"id": sid, "project": rel[0], "main": len(rel) == 2, "title": "", "cwd": None,
+            "branch": "", "last": 0, "chunks": []}
+    for line in path.open(encoding="utf-8", errors="replace"):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        typ = rec.get("type")
+        if typ in ("ai-title", "custom-title"):
+            part["title"] = rec.get("customTitle") or rec.get("aiTitle") or part["title"]
+            continue
+        if typ not in ("user", "assistant") or rec.get("isMeta"):
+            continue
+        cwd = rec.get("cwd")
+        if cwd and (not part["cwd"] or re.sub(r"[^A-Za-z0-9]", "-", cwd) == rel[0]):
+            part["cwd"] = cwd
+        part["branch"] = rec.get("gitBranch") or part["branch"]
+        part["last"] = max(part["last"], parse_ts(rec.get("timestamp")))
+        for who, text in record_chunks(rec):
+            text = " ".join(REMINDER.sub("", text).split())
+            if text:
+                part["chunks"].append((who, text))
+    part["last"] = part["last"] or path.stat().st_mtime
+    return part
+
+
+def parse_ts(ts):
+    # mtime lies: Claude Code appends bookkeeping records to old transcripts
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return 0
+
+
+def read_cache():
+    try:
+        with CACHE.open("rb") as f:
+            data = pickle.load(f)
+    except (OSError, pickle.PickleError, EOFError, AttributeError):
+        return {}
+    return data["files"] if data.get("version") == CACHE_VERSION else {}
+
+
+def write_cache(files):
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CACHE.with_suffix(".tmp")
+    with tmp.open("wb") as f:
+        pickle.dump({"version": CACHE_VERSION, "files": files}, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(CACHE)
+
+
+def load_index():
+    """Per-file parse results; only files whose size or mtime changed get re-parsed."""
+    cached, files, stale = read_cache(), {}, []
+    for p in ROOT.glob("**/*.jsonl"):
+        st = p.stat()
+        key = (st.st_mtime, st.st_size)
+        entry = cached.get(str(p))
+        if entry and entry[0] == key:
+            files[str(p)] = entry
+        else:
+            stale.append((p, key))
+    if not stale:
+        return files
+    if len(stale) > 50:
+        print(f"✻ indexing {len(stale)} transcripts (first run only)...", file=sys.stderr)
+    with ProcessPoolExecutor() as pool:
+        for (p, key), part in zip(stale, pool.map(parse_file, [p for p, _ in stale], chunksize=8)):
+            files[str(p)] = (key, part)
+    write_cache(files)
+    return files
+
+
+def build_sessions(files):
+    sessions = {}
+    for _, part in files.values():
+        s = sessions.setdefault(part["id"], {"id": part["id"], "project": part["project"], "title": "",
+                                              "cwd": None, "branch": "", "last": 0, "chunks": []})
+        if part["main"] or not s["cwd"]:
+            s["title"] = part["title"] or s["title"]
+            s["cwd"] = part["cwd"] or s["cwd"]
+            s["branch"] = part["branch"] or s["branch"]
+        s["last"] = max(s["last"], part["last"])
+        s["chunks"].extend(part["chunks"])
+    out = [s for s in sessions.values() if s["chunks"]]
+    for s in out:
+        s["blob"] = "\n".join(t for _, t in s["chunks"]).lower()
+    return sorted(out, key=lambda s: s["last"], reverse=True)
+
+
+# Search
+
+def search(sessions, query):
+    terms = query.lower().split()
+    if not terms:
+        return sessions, terms
+    hits = [s for s in sessions if all(t in s["blob"] for t in terms)]
+    # a session named after the query beats a passing mention, recency decides the rest
+    hits.sort(key=lambda s: not all(t in s["title"].lower() for t in terms))
+    return hits, terms
+
+
+def snippet(s, terms, width):
+    """Best chunk for the query (own words before tool noise), cut around the first term."""
+    if not terms:
+        who, text = next(((w, t) for w, t in s["chunks"] if w == "you"), s["chunks"][0])
+        return who, text[:width]
+    best = None
+    for who, text in s["chunks"]:
+        low = text.lower()
+        hit = next((t for t in terms if t in low), None)
+        if hit and (best is None or WHO_RANK[who] < WHO_RANK[best[0]]):
+            best = (who, text, low.find(hit))
+            if who == "you":
+                break
+    if best is None:
+        return "", ""
+    who, text, i = best
+    start = max(0, i - width // 3)
+    return who, ("…" if start else "") + text[start:start + width]
+
+
+def fmt_time(ts):
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%y %H:%M")
+
+
+def short_dir(s):
+    return (s["cwd"] or s["project"]).replace(str(Path.home()), "~")
+
+
+# UI, styled after Claude Code: rounded prompt box, ❯ selector, Claude orange accent
+
+class Picker:
+    def __init__(self, scr, sessions, query):
+        self.scr, self.sessions, self.query = scr, sessions, query
+        self.sel = self.top = 0
+        self.results, self.terms = search(sessions, query)
+        self.snippets = {}
+        self.dirty = False
+
+    def setup_colors(self):
+        curses.use_default_colors()
+        rich = curses.COLORS >= 256
+        palette = {1: 173 if rich else curses.COLOR_YELLOW,   # Claude orange
+                   2: 110 if rich else curses.COLOR_CYAN,     # directories
+                   3: 244 if rich else curses.COLOR_WHITE,    # muted text
+                   4: 222 if rich else curses.COLOR_YELLOW,   # query highlight
+                   5: 244 if rich else curses.COLOR_WHITE}    # muted twin, see hline
+        for pair, color in palette.items():
+            curses.init_pair(pair, color, -1)
+        self.accent = curses.color_pair(1)
+        self.blue = curses.color_pair(2)
+        self.muted = curses.color_pair(3) if rich else curses.A_DIM
+        self.muted_alt = curses.color_pair(5) if rich else curses.A_DIM | curses.color_pair(5)
+        self.mark = curses.color_pair(4) | curses.A_BOLD
+
+    def run(self):
+        self.setup_colors()
+        curses.curs_set(1)
+        self.scr.keypad(True)
+        self.scr.timeout(90)
+        while True:
+            self.draw()
+            try:
+                key = self.scr.get_wch()
+            except curses.error:
+                self.refilter()
+                continue
+            action = self.handle(key)
+            if action == "quit":
+                return None
+            if action == "pick":
+                return self.results[self.sel] if self.results else None
+
+    def handle(self, key):
+        if key in ("\x1b", "\x03", "\x04"):
+            return "quit"
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            self.refilter()
+            return "pick"
+        moves = {curses.KEY_UP: -1, "\x10": -1, curses.KEY_DOWN: 1, "\x0e": 1,
+                 curses.KEY_PPAGE: -self.rows(), curses.KEY_NPAGE: self.rows()}
+        if key in moves:
+            self.refilter()
+            self.sel = max(0, min(len(self.results) - 1, self.sel + moves[key]))
+            return None
+        if key in (curses.KEY_BACKSPACE, "\x7f", "\x08"):
+            self.query = self.query[:-1]
+        elif key == "\x15":
+            self.query = ""
+        elif key == "\x17":
+            self.query = self.query.rstrip().rpartition(" ")[0]
+        elif isinstance(key, str) and key.isprintable():
+            self.query += key
+        else:
+            return None
+        self.dirty = True
+
+    def refilter(self):
+        if not self.dirty:
+            return
+        self.dirty = False
+        self.results, self.terms = search(self.sessions, self.query)
+        self.sel = self.top = 0
+        self.snippets = {}
+
+    def rows(self):
+        return max(1, (self.scr.getmaxyx()[0] - HEADER_ROWS) // 3)
+
+    def draw(self):
+        h, w = self.scr.getmaxyx()
+        self.scr.erase()
+        self.draw_header(w)
+        rows = self.rows()
+        self.top = min(self.top, self.sel)
+        self.top = max(self.top, self.sel - rows + 1)
+        for i, s in enumerate(self.results[self.top:self.top + rows]):
+            self.draw_row(HEADER_ROWS + i * 3, s, self.top + i == self.sel, w)
+        if not self.results:
+            self.put(HEADER_ROWS, 2, "no session matches", self.muted)
+        count = f"{len(self.results)} of {len(self.sessions)} sessions"
+        below = len(self.results) - self.top - rows
+        if below > 0:
+            count = f"↓ {below} more · " + count
+        if self.top > 0:
+            count = f"↑ {self.top} · " + count
+        self.put(h - 1, 2, "↑↓ to select · enter to resume · esc to exit", self.muted)
+        self.put(h - 1, max(2, w - len(count) - 2), count, self.muted)
+        self.scr.move(3, min(w - 3, 4 + len(self.query[-(w - 8):])))
+        self.scr.refresh()
+
+    def draw_header(self, w):
+        x = self.put(0, 1, "✻ ", self.accent | curses.A_BOLD)
+        x = self.put(0, x, "ccfind", curses.A_BOLD)
+        self.put(0, x, "  search your Claude Code sessions", self.muted)
+        inner = max(0, w - 2)
+        self.hline(2, inner, "╭", "╮")
+        self.put(3, 0, "│", self.muted)
+        self.put(3, 2, ">", curses.A_BOLD)
+        if self.query:
+            self.put(3, 4, self.query[-(w - 8):])
+        else:
+            self.put(3, 4, "type words you remember, e.g. a ticket id or an error message", self.muted)
+        self.put(3, inner, "│", self.muted)
+        self.hline(4, inner, "╰", "╯")
+
+    def hline(self, y, right, left_corner, right_corner):
+        self.put(y, 0, left_corner, self.muted)
+        # macOS ncurses compresses a run of identical wide chars into a broken REP sequence,
+        # alternating two identical-looking color pairs keeps every cell distinct
+        for x in range(1, right):
+            self.put(y, x, "─", self.muted if x % 2 else self.muted_alt)
+        self.put(y, right, right_corner, self.muted)
+
+    def draw_row(self, y, s, selected, w):
+        pointer = self.accent | curses.A_BOLD if selected else 0
+        x = self.put(y, 1, "❯ " if selected else "  ", pointer)
+        x = self.put(y, x, (s["title"] or "(untitled)")[:max(10, w // 2)], pointer or curses.A_BOLD)
+        x = self.put(y, x, "  " + fmt_time(s["last"]), self.muted)
+        x = self.put(y, x, "  " + short_dir(s), self.blue)
+        if s["cwd"] and not os.path.isdir(s["cwd"]):
+            x = self.put(y, x, " (dir gone)", self.muted)
+        if s["branch"]:
+            self.put(y, x, "  ⎇ " + s["branch"], self.muted)
+        if s["id"] not in self.snippets:
+            self.snippets[s["id"]] = snippet(s, self.terms, w)
+        who, text = self.snippets[s["id"]]
+        x = self.put(y + 1, 3, "⎿  ", self.muted)
+        x = self.put(y + 1, x, f"{who}: " if who else "", self.muted)
+        self.put_highlighted(y + 1, x, text, w)
+
+    def put_highlighted(self, y, x, text, w):
+        text = text[:max(0, w - x - 1)]
+        low = text.lower()
+        marks = [False] * len(text)
+        for t in self.terms:
+            i = low.find(t)
+            while i >= 0:
+                marks[i:i + len(t)] = [True] * len(t)
+                i = low.find(t, i + 1)
+        i = 0
+        while i < len(text):
+            j = i
+            while j < len(text) and marks[j] == marks[i]:
+                j += 1
+            x = self.put(y, x, text[i:j], self.mark if marks[i] else 0)
+            i = j
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if y >= h or x >= w:
+            return x
+        text = text[:w - x]
+        try:
+            self.scr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+        return x + len(text)
+
+
+# Entry
+
+def resume(s):
+    cwd = s["cwd"]
+    if cwd and os.path.isdir(cwd):
+        os.chdir(cwd)
+    else:
+        print(f"directory {cwd} no longer exists, resuming from {os.getcwd()}")
+    print(f"\033[38;5;173m✻\033[0m resuming {s['title'] or s['id']}  \033[2m{os.getcwd()}\033[0m")
+    # through an interactive shell so a `claude` alias with your usual flags applies
+    shell = os.environ.get("SHELL", "/bin/sh")
+    os.execvp(shell, [shell, "-ic", f"claude --resume {s['id']}"])
+
+
+def print_list(results, terms, limit):
+    for i, s in enumerate(results[:limit], 1):
+        who, text = snippet(s, terms, 110)
+        print(f"{i:>2}. {fmt_time(s['last'])}  {s['title'] or '(untitled)'}  {short_dir(s)}  {s['branch']}")
+        print(f"    {who}: {text}")
+        print(f"    claude --resume {s['id']}")
+    if len(results) > limit:
+        print(f"... {len(results) - limit} more, use -n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Search Claude Code sessions and resume one.")
+    ap.add_argument("terms", nargs="*", help="words that must all appear (case-insensitive)")
+    ap.add_argument("-l", "--list", action="store_true", help="print matches instead of opening the picker")
+    ap.add_argument("-n", type=int, default=15, help="max sessions with -l (default 15)")
+    args = ap.parse_args()
+
+    sessions = build_sessions(load_index())
+    query = " ".join(args.terms)
+    if args.list or not sys.stdin.isatty():
+        results, terms = search(sessions, query)
+        print_list(results, terms, args.n)
+        return 0 if results else 1
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    picked = curses.wrapper(lambda scr: Picker(scr, sessions, query).run())
+    if picked:
+        resume(picked)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
